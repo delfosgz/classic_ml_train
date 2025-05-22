@@ -1,0 +1,256 @@
+class SimplePandasPreprocessor(mlflow.pyfunc.PythonModel):
+    
+    def __init__(self, 
+                 raw_categorical_cols_config, raw_numerical_cols_config, 
+                 date_col_config, premium_col_config, interactions_base_col_config, # Base cols for FE
+                 label_col_config, # Used only for TE fitting
+                 te_smoothing_config, 
+                 cat_impute_const_config, num_impute_strat_config):
+        
+        # Store configurations passed during instantiation
+        self.raw_cat_cols = list(raw_categorical_cols_config)
+        self.raw_num_cols = list(raw_numerical_cols_config)
+        self.date_col = date_col_config
+        self.premium_col = premium_col_config
+        self.interactions_base_col = interactions_base_col_config # e.g., "past_interactions_count"
+        
+        self.label_col_for_te = label_col_config 
+        self.te_smoothing = te_smoothing_factor
+        self.cat_impute_val = cat_impute_constant
+        self.num_impute_strat = num_impute_strategy
+
+        # These will be populated by the fit method
+        self.fitted_num_imputer = None
+        self.fitted_cat_imputer = None
+        self.fitted_target_encoder = None
+        self.fitted_scaler = None
+        self.final_feature_names_in_order = [] # Critical: defines output features and their order
+        self.impute_medians_for_final_features = {} # For imputing NaNs before scaling in transform
+
+    def _apply_user_custom_formatting(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Placeholder for user's initial custom data formatting."""
+        print("    Executing Step 0: Initial Custom Formatting (User to define logic)...")
+        # !!! REPLACE THIS WITH YOUR CUSTOM DATAFRAME CLEANING/FORMATTING LOGIC !!!
+        # Example: df_formatted = df.rename(columns={'old_name': 'new_name'})
+        # Ensure this function returns a DataFrame.
+        # Columns in self.raw_cat_cols and self.raw_num_cols should exist after this.
+        df_formatted = df.copy() 
+        # Add your logic here, e.g.:
+        # if 'some_column_to_clean' in df_formatted.columns:
+        #     df_formatted['some_column_to_clean'] = df_formatted['some_column_to_clean'].str.lower()
+        return df_formatted
+
+    def _engineer_base_features(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str], List[str]]:
+        """Creates basic engineered features from raw ones."""
+        print("    Executing Step 1: Base Feature Engineering...")
+        df_eng = df.copy()
+        new_cat_features, new_num_features = [], []
+
+        # Date features
+        if self.date_col and self.date_col in df_eng.columns:
+            try:
+                s_date = pd.to_datetime(df_eng[self.date_col], errors='coerce')
+                if not s_date.isnull().all():
+                    df_eng['fe_month'] = s_date.dt.month.astype(str)
+                    df_eng['fe_day_of_week'] = s_date.dt.dayofweek.astype(str)
+                    new_cat_features.extend(['fe_month', 'fe_day_of_week'])
+            except Exception as e: print(f"      Warning: Date FE failed for {self.date_col}: {e}")
+
+        # Premium transformations
+        if self.premium_col and self.premium_col in df_eng.columns:
+            prem_num = pd.to_numeric(df_eng[self.premium_col], errors='coerce')
+            df_eng['fe_log1p_premium'] = np.log1p(prem_num.fillna(0).clip(lower=0))
+            df_eng['fe_sq_premium'] = prem_num.fillna(0)**2
+            new_num_features.extend(['fe_log1p_premium', 'fe_sq_premium'])
+        
+        # Example: Log transform for another numeric interactions base column
+        if self.interactions_base_col and self.interactions_base_col in df_eng.columns:
+            inter_num = pd.to_numeric(df_eng[self.interactions_base_col], errors='coerce')
+            df_eng[f'fe_log1p_{self.interactions_base_col}'] = np.log1p(inter_num.fillna(0).clip(lower=0))
+            new_num_features.append(f'fe_log1p_{self.interactions_base_col}')
+            
+        print(f"      Created new categoricals: {new_cat_features}")
+        print(f"      Created new numericals: {new_num_features}")
+        return df_eng, new_cat_features, new_num_features
+
+    def _engineer_interaction_features(self, df: pd.DataFrame, target_encoded_cols: List[str]) -> Tuple[pd.DataFrame, List[str]]:
+        """Creates interaction features, typically post-target encoding."""
+        print("    Executing Step 4: Interaction Feature Engineering...")
+        df_interact = df.copy()
+        new_interaction_features = []
+
+        # Use log_premium if created, else original premium
+        premium_for_interact = f'fe_log1p_{self.premium_col}' if f'fe_log1p_{self.premium_col}' in df_interact.columns else self.premium_col
+        
+        if premium_for_interact not in df_interact.columns:
+            print("      Warning: Premium column for interaction not found. Skipping interactions.")
+            return df_interact, []
+        
+        # Ensure premium column is numeric for multiplication
+        df_interact[premium_for_interact] = pd.to_numeric(df_interact[premium_for_interact], errors='coerce').fillna(0)
+
+        # Interact premium with (now numeric) target-encoded categoricals
+        for te_col in target_encoded_cols: # te_cols are the original categorical names, now holding numeric TE values
+            if te_col in df_interact.columns: # Should always be true
+                interact_col_name = f"fe_inter_{premium_for_interact}_x_{te_col}"
+                # Ensure te_col is numeric (it should be after TargetEncoder)
+                df_interact[te_col] = pd.to_numeric(df_interact[te_col], errors='coerce').fillna(0)
+                df_interact[interact_col_name] = df_interact[premium_for_interact] * df_interact[te_col]
+                new_interaction_features.append(interact_col_name)
+                print(f"      Created interaction: {interact_col_name}")
+        
+        print(f"      Created new interactions: {new_interaction_features}")
+        return df_interact, new_interaction_features
+
+    def fit(self, train_pdf_raw_features: pd.DataFrame, train_y_series: pd.Series):
+        """Fits all preprocessing steps."""
+        print("  Fitting SimplePandasPreprocessor...")
+        
+        # Step 0: User's Custom Initial Formatting
+        df_custom_formatted = self._apply_user_custom_formatting(train_pdf_raw_features)
+
+        # Step 1: Base Feature Engineering
+        df_fe, eng_cat_cols, eng_num_cols = self._engineer_base_features(df_custom_formatted)
+        
+        # Define all numerical and categorical columns post-base FE
+        current_numerical_cols = list(set(self._get_valid_cols(df_fe, self.raw_num_cols) + eng_num_cols))
+        current_categorical_cols = list(set(self._get_valid_cols(df_fe, self.raw_cat_cols) + eng_cat_cols))
+        
+        # Step 2a: Impute Numerical Features
+        if current_numerical_cols:
+            num_imputer = SimpleImputer(strategy=self.num_impute_strat)
+            df_fe[current_numerical_cols] = num_imputer.fit_transform(df_fe[current_numerical_cols])
+            self.fitted_components['numerical_imputer'] = num_imputer
+            self.fitted_components['imputed_numerical_cols'] = current_numerical_cols
+        else: self.fitted_components['imputed_numerical_cols'] = []
+        
+        # Step 2b: Impute Categorical Features
+        if current_categorical_cols:
+            cat_imputer = SimpleImputer(strategy="constant", fill_value=self.cat_impute_val)
+            df_fe[current_categorical_cols] = cat_imputer.fit_transform(df_fe[current_categorical_cols])
+            self.fitted_components['categorical_imputer'] = cat_imputer
+            self.fitted_components['imputed_categorical_cols'] = current_categorical_cols
+        else: self.fitted_components['imputed_categorical_cols'] = []
+
+        # Step 3: Target Encode Categoricals
+        # Uses imputed categorical columns
+        target_encoded_cols_list = []
+        cols_to_te = self.fitted_components.get('imputed_categorical_cols', [])
+        if cols_to_te:
+            for col in cols_to_te: df_fe[col] = df_fe[col].astype('category')
+            target_encoder = ce.TargetEncoder(
+                cols=cols_to_te, smoothing=self.te_smoothing, 
+                handle_unknown='value', handle_missing='value'
+            )
+            # TargetEncoder modifies specified columns in place when fit_transform is used on a subset
+            df_fe_te_transformed_subset = target_encoder.fit_transform(df_fe[cols_to_te], train_y_series)
+            for col in cols_to_te: # Update the main df
+                df_fe[col] = df_fe_te_transformed_subset[col]
+
+            self.fitted_components['target_encoder'] = target_encoder
+            target_encoded_cols_list = list(cols_to_te) # These are now numeric
+            self.fitted_components['target_encoded_cols_list'] = target_encoded_cols_list # Store original names of TE'd cols
+        else: self.fitted_components['target_encoded_cols_list'] = []
+        
+        # Step 4: Interaction Feature Engineering (Post-TE)
+        df_interactions, engineered_interaction_cols_list = self._engineer_interaction_features(df_fe, target_encoded_cols_list)
+        self.fitted_components['engineered_interaction_cols_list'] = engineered_interaction_cols_list
+        
+        # Step 5: Scaling - Define final feature set for scaling
+        # This includes: original numerics (imputed), base engineered numerics (imputed), 
+        # target-encoded categoricals (now numeric), and interaction features (numeric).
+        self.final_feature_columns_in_order = list(set(
+            self.fitted_components.get('imputed_numerical_cols', []) +
+            self.fitted_components.get('target_encoded_cols_list', []) + 
+            self.fitted_components.get('engineered_interaction_cols_list', [])
+        ))
+        # Ensure consistent order (e.g., sorted)
+        self.final_feature_columns_in_order.sort() 
+        self.fitted_components['final_feature_columns_in_order'] = self.final_feature_columns_in_order
+
+        # Final imputation pass before scaling for any NaNs created by TE 'value' or interactions
+        if self.final_feature_columns_in_order:
+            temp_final_impute_medians = {}
+            for col in self.final_feature_columns_in_order:
+                # Ensure column exists and is numeric, if not, problem upstream
+                if col not in df_interactions.columns: 
+                    print(f"    Warning: Column '{col}' expected for scaling not found. Creating as 0."); df_interactions[col] = 0
+                df_interactions[col] = pd.to_numeric(df_interactions[col], errors='coerce')
+                if df_interactions[col].isnull().any():
+                    median_val = df_interactions[col].median()
+                    df_interactions[col] = df_interactions[col].fillna(median_val)
+                    temp_final_impute_medians[col] = median_val
+            if temp_final_impute_medians:
+                self.fitted_components['impute_medians_for_final_features'] = temp_final_impute_medians
+
+            scaler = StandardScaler()
+            df_interactions[self.final_feature_columns_in_order] = scaler.fit_transform(df_interactions[self.final_feature_columns_in_order])
+            self.fitted_components['scaler'] = scaler
+            print(f"    Fitted StandardScaler on {len(self.final_feature_columns_in_order)} final features.")
+        else:
+            print("    No final features to scale.")
+        
+        print("  SimplePandasPreprocessor fitting complete.")
+        return self # Return self with fitted components
+
+    def transform(self, df_raw_features: pd.DataFrame) -> pd.DataFrame:
+        """Applies all fitted transformations to new raw feature data."""
+        print(f"  Transforming data with SimplePandasPreprocessor (input shape {df_raw_features.shape})...")
+        if not self.fitted_components or not self.final_feature_columns_in_order:
+            raise RuntimeError("Preprocessor has not been fitted. Call fit() first.")
+
+        df_custom = self._apply_user_custom_formatting(df_raw_features.copy())
+        df_fe = self._engineer_base_features(df_custom) # Don't pass is_fitting_phase
+
+        # Impute Numerical
+        imputed_num_cols = self.fitted_components.get('imputed_numerical_cols', [])
+        valid_num_cols = self._get_valid_cols(df_fe, imputed_num_cols)
+        if valid_num_cols and self.fitted_components.get('numerical_imputer'):
+            df_fe[valid_num_cols] = self.fitted_components['numerical_imputer'].transform(df_fe[valid_num_cols])
+
+        # Impute Categorical
+        imputed_cat_cols = self.fitted_components.get('imputed_categorical_cols', [])
+        valid_cat_cols = self._get_valid_cols(df_fe, imputed_cat_cols)
+        if valid_cat_cols and self.fitted_components.get('categorical_imputer'):
+            df_fe[valid_cat_cols] = self.fitted_components['categorical_imputer'].transform(df_fe[valid_cat_cols])
+        
+        # Target Encode
+        te_cols = self.fitted_components.get('target_encoded_cols_list', [])
+        valid_te_cols = self._get_valid_cols(df_fe, te_cols)
+        if valid_te_cols and self.fitted_components.get('target_encoder'):
+            for col in valid_te_cols: df_fe[col] = df_fe[col].astype('category')
+            # TargetEncoder's transform only needs X
+            transformed_te_subset = self.fitted_components['target_encoder'].transform(df_fe[valid_te_cols])
+            for col in valid_te_cols: # Update main dataframe
+                df_fe[col] = transformed_te_subset[col]
+        
+        # Interaction Features
+        df_interactions, _ = self._engineer_interaction_features(df_fe, is_fitting_phase=False)
+        
+        # Final Imputation and Scaling
+        # Create a DataFrame with only the final_feature_columns_in_order, handling missing ones
+        df_for_scaling = pd.DataFrame(index=df_interactions.index)
+        final_impute_medians = self.fitted_components.get('impute_medians_for_final_features', {})
+        for col in self.final_feature_columns_in_order:
+            if col in df_interactions.columns:
+                df_for_scaling[col] = pd.to_numeric(df_interactions[col], errors='coerce')
+                if df_for_scaling[col].isnull().any(): # Impute if NaNs present
+                    df_for_scaling[col] = df_for_scaling[col].fillna(final_impute_medians.get(col, 0)) # Use learned median or 0
+            else: # Column expected by scaler is missing
+                print(f"    Warning: Feature column '{col}' for scaling not found in input. Creating as 0 for scaling.")
+                df_for_scaling[col] = 0 # Or some other default
+        
+        if self.final_feature_columns_in_order and self.fitted_components.get('scaler'):
+            # Ensure df_for_scaling only has columns in final_feature_columns_in_order before transform
+            df_for_scaling_ordered = df_for_scaling[self.final_feature_columns_in_order]
+            scaled_values = self.fitted_components['scaler'].transform(df_for_scaling_ordered)
+            df_processed = pd.DataFrame(scaled_values, columns=self.final_feature_columns_in_order, index=df_for_scaling_ordered.index)
+        elif self.final_feature_columns_in_order: # Scaler not fitted, but return features in order
+            df_processed = df_for_scaling[self.final_feature_columns_in_order]
+            print("    Warning: Scaler not fitted/found. Returning features before scaling but in final order.")
+        else: # No final features defined
+            print("    Warning: No final features defined for preprocessor. Returning empty DataFrame.")
+            df_processed = pd.DataFrame(index=df_raw_features.index)
+
+        print(f"  Transformation complete. Output shape: {df_processed.shape}")
+        return df_processed
